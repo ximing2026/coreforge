@@ -644,6 +644,47 @@ function commentJson(
   };
 }
 
+/** Squash-merge a pull request into its base branch. Returns the merge commit sha, or 'conflict'. */
+export function squashMergePull(forge: Forge, repo: RepoRecord, issue: IssueRecord, message?: string): string | 'conflict' {
+  const pull = issue.pull as NonNullable<IssueRecord['pull']>;
+  const headTip = refSha(repo, branchRef(pull.headRef));
+  const baseTip = refSha(repo, branchRef(pull.baseRef));
+  if (headTip === undefined || baseTip === undefined) return 'conflict';
+  const base = mergeBase(repo, headTip, baseTip);
+  const ancestorTree = base === null ? ensureEmptyTree(repo) : (commitTree(repo, base) ?? ensureEmptyTree(repo));
+  const baseTree = commitTree(repo, baseTip) ?? ensureEmptyTree(repo);
+  const headTree = commitTree(repo, headTip) ?? ensureEmptyTree(repo);
+  const mergedTree = mergeTrees(repo, ancestorTree, baseTree, headTree);
+  if (mergedTree === null) return 'conflict';
+  const sha = makeCommit(repo, forge, {
+    tree: mergedTree,
+    parentSha: baseTip,
+    message: message ?? `Merge pull request #${issue.number} (squash)`,
+    author: VIEWER,
+  });
+  repo.refs.set(branchRef(pull.baseRef), sha);
+  pull.merged = true;
+  pull.mergedAtSeq = forge.tick();
+  pull.mergeCommitSha = sha;
+  pull.state = 'closed';
+  issue.state = 'closed';
+  return sha;
+}
+
+/** Whether a pull request merges cleanly into its base right now (GraphQL's mergeable). */
+export function pullMergeable(repo: RepoRecord, issue: IssueRecord): boolean {
+  const pull = issue.pull as NonNullable<IssueRecord['pull']>;
+  if (pull.merged) return false;
+  const headTip = refSha(repo, branchRef(pull.headRef));
+  const baseTip = refSha(repo, branchRef(pull.baseRef));
+  if (headTip === undefined || baseTip === undefined) return false;
+  const base = mergeBase(repo, headTip, baseTip);
+  const ancestorTree = base === null ? ensureEmptyTree(repo) : (commitTree(repo, base) ?? ensureEmptyTree(repo));
+  const baseTree = commitTree(repo, baseTip) ?? ensureEmptyTree(repo);
+  const headTree = commitTree(repo, headTip) ?? ensureEmptyTree(repo);
+  return mergeTrees(repo, ancestorTree, baseTree, headTree) !== null;
+}
+
 function handlePulls(forge: Forge, req: RestRequest, repo: RepoRecord, rest: string[]): RestReply {
   const method = req.method;
   if (rest.length === 0) {
@@ -723,22 +764,11 @@ function handlePulls(forge: Forge, req: RestRequest, repo: RepoRecord, rest: str
     const headTip = refSha(repo, branchRef(pull.headRef));
     const baseTip = refSha(repo, branchRef(pull.baseRef));
     if (headTip === undefined || baseTip === undefined) return notFound();
-    const base = mergeBase(repo, headTip, baseTip);
-    const ancestorTree = base === null ? ensureEmptyTree(repo) : (commitTree(repo, base) ?? ensureEmptyTree(repo));
-    const baseTree = commitTree(repo, baseTip) ?? ensureEmptyTree(repo);
-    const headTree = commitTree(repo, headTip) ?? ensureEmptyTree(repo);
-    const mergedTree = mergeTrees(repo, ancestorTree, baseTree, headTree);
-    if (mergedTree === null) return { status: 405, body: { message: 'Merge conflict: the pull request cannot be merged cleanly' } };
     const body = asObject(req.body);
-    const message = str(body.commit_message) ?? str(body.commit_title) ?? `Merge pull request #${issue.number} (squash)`;
-    const sha = makeCommit(repo, forge, { tree: mergedTree, parentSha: baseTip, message, author: VIEWER });
-    repo.refs.set(branchRef(pull.baseRef), sha);
-    pull.merged = true;
-    pull.mergedAtSeq = forge.tick();
-    pull.mergeCommitSha = sha;
-    pull.state = 'closed';
-    issue.state = 'closed';
-    return { status: 200, body: { sha, merged: true, message: 'Pull Request successfully merged' } };
+    const message = str(body.commit_message) ?? str(body.commit_title);
+    const result = squashMergePull(forge, repo, issue, message);
+    if (result === 'conflict') return { status: 405, body: { message: 'Merge conflict: the pull request cannot be merged cleanly' } };
+    return { status: 200, body: { sha: result, merged: true, message: 'Pull Request successfully merged' } };
   }
 
   return notFound();
