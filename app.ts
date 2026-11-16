@@ -81,6 +81,7 @@ export function createApp(): Server {
           query: url.searchParams,
           body: parsed,
           rawBody: body.toString('utf8'),
+          baseUrl: `http://${req.headers.host ?? 'forge.invalid'}`,
         });
         if (reply.status === 204 || reply.body === undefined) {
           res.writeHead(reply.status, { 'x-github-request-id': requestId, ...(reply.headers ?? {}) });

@@ -110,11 +110,12 @@ function readSection(reader: ReturnType<typeof pktReader>): { lines: string[]; e
   }
 }
 
-function lsRefs(repo: RepoRecord, args: string[]): GitHttpReply {
+function lsRefs(repo: RepoRecord, rawArgs: string[]): GitHttpReply {
+  const args = rawArgs.map((line) => line.replace(/\n$/, ''));
   const peelWanted = args.includes('peel');
   const symrefsWanted = args.includes('symrefs');
   const unbornWanted = args.includes('unborn');
-  const prefixes = args.filter((line) => line.startsWith('ref-prefix ')).map((line) => line.slice('ref-prefix '.length).replace(/\n$/, ''));
+  const prefixes = args.filter((line) => line.startsWith('ref-prefix ')).map((line) => line.slice('ref-prefix '.length));
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
   const out: Buffer[] = [];
   const head = headTarget(repo);
@@ -142,11 +143,19 @@ function lsRefs(repo: RepoRecord, args: string[]): GitHttpReply {
 interface CollectedPack {
   objects: GitObject[];
   shallow: string[];
+  unshallow: string[];
 }
 
 /** The object closure for a fetch: from the wants, minus everything reachable from the haves. */
-function collectPack(repo: RepoRecord, wants: readonly string[], haves: ReadonlySet<string>, depthLimit: number | null): CollectedPack {
-  // Everything reachable from a have is already with the client.
+function collectPack(
+  repo: RepoRecord,
+  wants: readonly string[],
+  haves: ReadonlySet<string>,
+  depthLimit: number | null,
+  clientShallow: ReadonlySet<string> = new Set(),
+): CollectedPack {
+  // Everything reachable from a have is already with the client — except that a commit the
+  // client itself calls shallow cuts the walk: it holds that commit but not its parents.
   const excluded = new Set<string>();
   const markExcluded = (tip: string): void => {
     const stack = [tip];
@@ -158,7 +167,8 @@ function collectPack(repo: RepoRecord, wants: readonly string[], haves: Readonly
       excluded.add(sha);
       if (obj.type === 'commit') {
         const info = parseCommit(obj.body);
-        stack.push(info.tree, ...info.parents);
+        stack.push(info.tree);
+        if (!clientShallow.has(sha)) stack.push(...info.parents);
       } else if (obj.type === 'tree') {
         for (const entry of parseTreeEntries(repo, sha)) stack.push(entry.sha);
       } else if (obj.type === 'tag') {
@@ -170,7 +180,6 @@ function collectPack(repo: RepoRecord, wants: readonly string[], haves: Readonly
   for (const have of haves) markExcluded(have);
 
   const included = new Map<string, GitObject>();
-  const shallow: string[] = [];
   const include = (sha: string): GitObject | undefined => {
     if (excluded.has(sha) || included.has(sha)) return repo.store.get(sha);
     const obj = repo.store.get(sha);
@@ -188,7 +197,9 @@ function collectPack(repo: RepoRecord, wants: readonly string[], haves: Readonly
     }
   };
 
-  // Breadth-first over commits so deepen counts generations the way git does.
+  // Breadth-first over commits so deepen counts generations the way git does. Traversal walks
+  // THROUGH commits the client already has (a deepen starts from a shallow boundary the client
+  // names as a have); only the inclusion of objects honours the exclusion set.
   const depthOf = new Map<string, number>();
   const queue: string[] = [];
   for (const want of wants) {
@@ -212,17 +223,20 @@ function collectPack(repo: RepoRecord, wants: readonly string[], haves: Readonly
       }
     }
   }
+  const shallowBoundary = new Set<string>();
   while (queue.length > 0) {
     const sha = queue.shift() as string;
     const depth = depthOf.get(sha) as number;
-    if (excluded.has(sha)) continue;
-    const obj = include(sha);
-    if (obj === undefined) continue;
+    const obj = repo.store.get(sha);
+    if (obj === undefined || obj.type !== 'commit') continue;
     const info = parseCommit(obj.body);
-    includeTree(info.tree);
+    if (!excluded.has(sha)) {
+      include(sha);
+      includeTree(info.tree);
+    }
     const atLimit = depthLimit !== null && depth >= depthLimit;
     if (atLimit) {
-      if (info.parents.length > 0) shallow.push(sha);
+      if (info.parents.length > 0 && !excluded.has(sha)) shallowBoundary.add(sha);
       continue;
     }
     for (const parent of info.parents) {
@@ -232,7 +246,15 @@ function collectPack(repo: RepoRecord, wants: readonly string[], haves: Readonly
       }
     }
   }
-  return { objects: [...included.values()], shallow };
+  // A client-shallow commit whose parent this fetch delivered is no longer shallow.
+  const unshallow: string[] = [];
+  for (const sha of clientShallow) {
+    const obj = repo.store.get(sha);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    const parents = parseCommit(obj.body).parents;
+    if (parents.some((parent) => included.has(parent))) unshallow.push(sha);
+  }
+  return { objects: [...included.values()], shallow: [...shallowBoundary], unshallow };
 }
 
 import { parseTree as parseTreeOf } from './gitobj.ts';
@@ -242,10 +264,10 @@ function parseTreeEntries(repo: RepoRecord, treeSha: string): { mode: string; na
   return parseTreeOf(obj.body);
 }
 
-/** Frame pack bytes as side-band-64k packets (band 1), in under-64k chunks. */
+/** Frame pack bytes as side-band-64k packets (band 1); a pkt-line's length field caps at 65520. */
 function sidebandPack(pack: Buffer): Buffer[] {
   const parts: Buffer[] = [];
-  const CHUNK = 65519;
+  const CHUNK = 65515;
   for (let at = 0; at < pack.length; at += CHUNK) {
     const slice = pack.subarray(at, at + CHUNK);
     parts.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
@@ -257,6 +279,7 @@ function fetchV2(repo: RepoRecord, args: string[]): GitHttpReply {
   const wants: string[] = [];
   const wantRefs: string[] = [];
   const haves = new Set<string>();
+  const clientShallow = new Set<string>();
   let done = false;
   let depthLimit: number | null = null;
   for (const rawLine of args) {
@@ -264,6 +287,7 @@ function fetchV2(repo: RepoRecord, args: string[]): GitHttpReply {
     if (line.startsWith('want ')) wants.push(line.slice(5).trim());
     else if (line.startsWith('want-ref ')) wantRefs.push(line.slice('want-ref '.length).trim());
     else if (line.startsWith('have ')) haves.add(line.slice(5).trim());
+    else if (line.startsWith('shallow ')) clientShallow.add(line.slice('shallow '.length).trim());
     else if (line.startsWith('deepen ')) depthLimit = Number.parseInt(line.slice('deepen '.length), 10) || null;
     else if (line === 'done') done = true;
   }
@@ -286,10 +310,11 @@ function fetchV2(repo: RepoRecord, args: string[]): GitHttpReply {
   }
   // With `done` in the request the server answers with the pack directly — acknowledgments
   // belong to negotiation rounds, and git rejects an acknowledgments section after done.
-  const { objects, shallow } = collectPack(repo, wants, haves, depthLimit);
-  if (depthLimit !== null) {
+  const { objects, shallow, unshallow } = collectPack(repo, wants, haves, depthLimit, clientShallow);
+  if (depthLimit !== null || clientShallow.size > 0) {
     out.push(pktLine('shallow-info\n'));
     for (const sha of shallow) out.push(pktLine(`shallow ${sha}\n`));
+    for (const sha of unshallow) out.push(pktLine(`unshallow ${sha}\n`));
     out.push(pktLine(null));
   }
   if (wantedRefLines.length > 0) {

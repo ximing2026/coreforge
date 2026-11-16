@@ -28,6 +28,8 @@ export interface RestRequest {
   body: unknown;
   /** The raw body text, to tell malformed JSON apart from an absent body. */
   rawBody: string;
+  /** The origin the client dialed (http://host), for absolute Link headers. */
+  baseUrl: string;
 }
 
 export interface RestReply {
@@ -317,7 +319,7 @@ function listUserRepos(forge: Forge, req: RestRequest): RestReply {
   const slice = all.slice((page - 1) * perPage, page * perPage);
   const headers: Record<string, string> = {};
   if (page * perPage < all.length) {
-    headers.link = `</api/v3/user/repos?page=${page + 1}&per_page=${perPage}>; rel="next", </api/v3/user/repos?page=${Math.ceil(all.length / perPage)}&per_page=${perPage}>; rel="last"`;
+    headers.link = `<${req.baseUrl}/api/v3/user/repos?page=${page + 1}&per_page=${perPage}>; rel="next", <${req.baseUrl}/api/v3/user/repos?page=${Math.ceil(all.length / perPage)}&per_page=${perPage}>; rel="last"`;
   }
   return { status: 200, body: slice.map((repo) => repoJson(forge, repo)), headers };
 }

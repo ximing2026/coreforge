@@ -179,24 +179,37 @@ export interface PackReadResult {
 /**
  * Inflate the zlib stream starting at `offset`, returning its data and the offset just past it.
  * Node's inflateSync ignores trailing bytes but throws on a truncated stream, so the exact end is
- * the shortest prefix that inflates — found by binary search.
+ * the shortest prefix that inflates — found by exponential search, then bisection in the last span.
  */
 function inflateAt(pack: Buffer, offset: number): { data: Buffer; next: number } {
   const tail = pack.subarray(offset);
-  let lo = 1;
-  let hi = tail.length;
   let data: Buffer | undefined;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
+  const tryLength = (length: number): boolean => {
     try {
-      data = inflateSync(tail.subarray(0, mid));
-      hi = mid - 1;
+      data = inflateSync(tail.subarray(0, length));
+      return true;
     } catch {
-      lo = mid + 1;
+      return false;
     }
+  };
+  let lo = 0;
+  let hi = 32;
+  while (hi < tail.length && !tryLength(hi)) {
+    lo = hi;
+    hi *= 2;
   }
-  if (data === undefined) throw new Error('corrupt zlib stream in pack');
-  return { data, next: offset + lo };
+  if (hi >= tail.length) {
+    if (!tryLength(tail.length)) throw new Error('corrupt zlib stream in pack');
+    return { data: data as Buffer, next: offset + tail.length };
+  }
+  // Invariant: `hi` inflates, every length up to `lo` does not (lo = 0 stands for "nothing tried").
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (tryLength(mid)) hi = mid;
+    else lo = mid;
+  }
+  tryLength(hi);
+  return { data: data as Buffer, next: offset + hi };
 }
 
 interface PendingObject {
