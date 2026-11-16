@@ -1,5 +1,9 @@
 # Coreforge — a GitHub-compatible git forge in one Node process
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/ximing2026/coreforge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/ximing2026/coreforge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 A standalone forge that speaks the four surfaces GitHub's own tooling uses, built for
 [make.fun's github-core-clone-01](https://make.fun/bounty/github-core-clone-01). No git binary,
 no database, no packages: one Node 22 process, Node builtins only, everything in memory.
